@@ -1,0 +1,14 @@
+pandas
+numpy
+matplotlib
+seaborn
+openpyxl
+scikit-learn
+shap
+lime 
+xgboost 
+tensorflow
+catboost
+lightgbm
+pytorch_tabnet
+pytorch_tabular
