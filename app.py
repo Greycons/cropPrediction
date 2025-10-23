@@ -228,6 +228,11 @@ if page == "🏠 Home":
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         st.markdown("""
+        <style>
+            .metric-card {
+                color: black; /* text color */
+            }
+        </style>
         <div class="metric-card">
             <h3>Welcome to Crop Prediction AI!</h3>
             <p>Get intelligent crop recommendations based on your location and soil conditions. 
@@ -306,6 +311,11 @@ elif page == "📍 Location Prediction":
                 for i, (_, row) in enumerate(crop_performance.head(5).iterrows()):
                     with st.container():
                         st.markdown(f"""
+                        <style>
+                        .prediction-card {{
+                            color: black; 
+                        }}
+                        </style>
                         <div class="prediction-card">
                             <h4>#{i+1} {row['crop']}</h4>
                             <p><strong>Average Yield:</strong> {row['mean']:.1f} kg/acre</p>
