@@ -83,6 +83,234 @@ def generate_ai_response(prompt):
         Ask me anything about farming, soil conditions, or crop predictions!
         """
 
+def get_crop_recommendations_ml_only(input_data, models, df_clean):
+    """Get crop recommendations using only ML models"""
+    
+    if df_clean is None or not models:
+        return None
+    
+    # Get available crops from the dataset
+    available_crops = df_clean['crop'].unique()
+    
+    # Store predictions for each crop
+    crop_predictions = {}
+    
+    # Test each crop with the given parameters
+    for crop in available_crops:
+        # Find the most common location for this crop in the dataset
+        crop_data = df_clean[df_clean['crop'] == crop]
+        if len(crop_data) > 0:
+            # Get the most frequent state-district combination for this crop
+            location_counts = crop_data.groupby(['state', 'district']).size().reset_index(name='count')
+            most_common_location = location_counts.loc[location_counts['count'].idxmax()]
+            state = most_common_location['state']
+            district = most_common_location['district']
+        else:
+            # Fallback to first available location
+            state = df_clean['state'].iloc[0]
+            district = df_clean['district'].iloc[0]
+        
+        # Create input data with this crop and its most common location
+        test_input = input_data.copy()
+        test_input['state'] = state
+        test_input['district'] = district
+        test_input['crop'] = crop
+        
+        # Create DataFrame
+        input_df = pd.DataFrame([test_input])
+        
+        # One-hot encode categorical variables
+        input_encoded = pd.get_dummies(input_df, columns=['state', 'district', 'crop'], drop_first=True)
+        
+        # Load feature info if available
+        feature_info = None
+        try:
+            with open('notebooks/feature_info.pkl', 'rb') as f:
+                feature_info = pickle.load(f)
+        except:
+            pass
+        
+        if feature_info:
+            # Use the exact feature columns from training
+            expected_columns = feature_info['feature_columns']
+            
+            # Add missing columns with 0
+            for col in expected_columns:
+                if col not in input_encoded.columns:
+                    input_encoded[col] = 0
+            
+            # Reorder columns to match training data exactly
+            input_encoded = input_encoded[expected_columns]
+        
+        # Get predictions from all models for this crop
+        crop_model_predictions = []
+        working_models = 0
+        
+        for model_name, model in models.items():
+            try:
+                if isinstance(model, dict) and 'model' in model:
+                    # Handle models with scalers
+                    scaler = model.get('scaler')
+                    model_obj = model['model']
+                    if scaler and model_obj:
+                        input_scaled = scaler.transform(input_encoded)
+                        pred = model_obj.predict(input_scaled)[0]
+                    else:
+                        pred = model_obj.predict(input_encoded)[0]
+                else:
+                    pred = model.predict(input_encoded)[0]
+                
+                crop_model_predictions.append(pred)
+                working_models += 1
+            except Exception as e:
+                continue
+        
+        if crop_model_predictions:
+            # Calculate average prediction for this crop
+            avg_prediction = np.mean(crop_model_predictions)
+            crop_predictions[crop] = {
+                'avg_yield': avg_prediction,
+                'model_count': working_models,
+                'individual_predictions': crop_model_predictions,
+                'location_used': f"{state}, {district}"
+            }
+    
+    if not crop_predictions:
+        return None
+    
+    # Calculate ML scores based on yield predictions
+    yields = [data['avg_yield'] for data in crop_predictions.values()]
+    min_yield = min(yields)
+    max_yield = max(yields)
+    
+    # Calculate scores and confidence
+    crop_scores = []
+    for crop, data in crop_predictions.items():
+        # Normalize yield to 0-100 score
+        if max_yield > min_yield:
+            score = ((data['avg_yield'] - min_yield) / (max_yield - min_yield)) * 100
+        else:
+            score = 50  # Default score if all yields are same
+        
+        # Confidence based on number of working models
+        if data['model_count'] >= 6:
+            confidence = "High"
+        elif data['model_count'] >= 4:
+            confidence = "Medium"
+        else:
+            confidence = "Low"
+        
+        crop_scores.append((crop, score, confidence, data['avg_yield'], data['model_count']))
+    
+    # Sort by score (descending)
+    crop_scores.sort(key=lambda x: x[1], reverse=True)
+    
+    return crop_scores, crop_predictions
+
+def get_crop_recommendations_combined(input_data, models, df_clean):
+    """Get crop recommendations using both historical data and ML models"""
+    
+    # Get ML recommendations
+    ml_recommendations, _ = get_crop_recommendations_ml_only(input_data, models, df_clean)
+    
+    if ml_recommendations is None:
+        return None
+    
+    # Get historical recommendations
+    historical_recommendations = get_crop_recommendations_historical(input_data, df_clean)
+    
+    if historical_recommendations is None:
+        return ml_recommendations
+    
+    # Combine both methods (weighted average)
+    combined_scores = []
+    
+    for crop, ml_score, ml_conf, ml_yield, ml_count in ml_recommendations:
+        # Find historical data for this crop
+        hist_data = next((item for item in historical_recommendations if item[0] == crop), None)
+        
+        if hist_data:
+            hist_score, hist_yield = hist_data[1], hist_data[3]  # hist_data[3] is avg_yield
+            # Weighted combination: 70% ML, 30% Historical
+            combined_score = (ml_score * 0.7) + (hist_score * 0.3)
+            combined_yield = (ml_yield * 0.7) + (hist_yield * 0.3)
+        else:
+            combined_score = ml_score * 0.8  # Reduce score if no historical data
+            combined_yield = ml_yield
+        
+        # Determine confidence
+        if ml_count >= 6 and hist_data:
+            confidence = "High"
+        elif ml_count >= 4:
+            confidence = "Medium"
+        else:
+            confidence = "Low"
+        
+        combined_scores.append((crop, combined_score, confidence, combined_yield, ml_count))
+    
+    # Sort by combined score
+    combined_scores.sort(key=lambda x: x[1], reverse=True)
+    
+    return combined_scores
+
+def get_crop_recommendations_historical(input_data, df_clean):
+    """Get crop recommendations using only historical data analysis"""
+    
+    if df_clean is None:
+        return None
+    
+    # Filter data based on input parameters (with some tolerance)
+    filtered_data = df_clean.copy()
+    
+    # Apply filters with tolerance ranges
+    tolerance = 0.1  # 10% tolerance
+    
+    filtered_data = filtered_data[
+        (filtered_data['soil_ph'] >= input_data['soil_ph'] * (1 - tolerance)) &
+        (filtered_data['soil_ph'] <= input_data['soil_ph'] * (1 + tolerance)) &
+        (filtered_data['rainfall_mm'] >= input_data['rainfall_mm'] * (1 - tolerance)) &
+        (filtered_data['rainfall_mm'] <= input_data['rainfall_mm'] * (1 + tolerance)) &
+        (filtered_data['soil_nitrogen'] >= input_data['soil_nitrogen'] * (1 - tolerance)) &
+        (filtered_data['soil_nitrogen'] <= input_data['soil_nitrogen'] * (1 + tolerance))
+    ]
+    
+    if len(filtered_data) == 0:
+        # If no matching data, use all data
+        filtered_data = df_clean
+    
+    # Get crop performance
+    crop_performance = filtered_data.groupby('crop')['crop_yield'].agg(['mean', 'count']).reset_index()
+    crop_performance = crop_performance.sort_values('mean', ascending=False)
+    
+    # Calculate scores
+    yields = crop_performance['mean'].values
+    min_yield = min(yields)
+    max_yield = max(yields)
+    
+    historical_scores = []
+    for _, row in crop_performance.iterrows():
+        crop = row['crop']
+        avg_yield = row['mean']
+        count = row['count']
+        
+        # Normalize yield to 0-100 score
+        if max_yield > min_yield:
+            score = ((avg_yield - min_yield) / (max_yield - min_yield)) * 100
+        else:
+            score = 50
+        
+        # Confidence based on data count
+        if count >= 20:
+            confidence = "High"
+        elif count >= 10:
+            confidence = "Medium"
+        else:
+            confidence = "Low"
+        
+        historical_scores.append((crop, score, confidence, avg_yield, count))
+    
+    return historical_scores
+
 # Page configuration
 st.set_page_config(
     page_title="🌾 Crop Prediction AI",
@@ -94,25 +322,44 @@ st.set_page_config(
 # Custom CSS
 st.markdown("""
 <style>
+    /* Global text color - white for most elements */
+    body, .main, .stApp {
+        color: #ffffff !important;
+    }
+    
+    /* Main header */
     .main-header {
         font-size: 3rem;
         color: #2E8B57;
         text-align: center;
         margin-bottom: 2rem;
     }
+    
+    /* Cards with white background - keep black text */
     .metric-card {
         background-color: #f0f8ff;
         padding: 1rem;
         border-radius: 10px;
         border-left: 5px solid #2E8B57;
+        color: #000000 !important;
     }
+    .metric-card h3, .metric-card p {
+        color: #000000 !important;
+    }
+    
     .prediction-card {
         background-color: #f5f5f5;
         padding: 1.5rem;
         border-radius: 10px;
         border: 2px solid #2E8B57;
         margin: 1rem 0;
+        color: #000000 !important;
     }
+    .prediction-card h4, .prediction-card p {
+        color: #000000 !important;
+    }
+    
+    /* Tabs */
     .stTabs [data-baseweb="tab-list"] {
         gap: 2px;
     }
@@ -124,10 +371,71 @@ st.markdown("""
         gap: 1px;
         padding-left: 20px;
         padding-right: 20px;
+        color: #000000 !important;
     }
     .stTabs [aria-selected="true"] {
         background-color: #2E8B57;
-        color: white;
+        color: white !important;
+    }
+    
+    /* Input textboxes - keep black text on white background */
+    .stTextInput input, .stTextArea textarea, .stSelectbox select, 
+    .stSlider input, .stNumberInput input, .stDateInput input {
+        color: #000000 !important;
+        background-color: #ffffff !important;
+    }
+    
+    /* Text in input containers */
+    .stTextInput label, .stTextArea label, .stSelectbox label, 
+    .stSlider label, .stNumberInput label, .stDateInput label {
+        color: #ffffff !important;
+    }
+    
+    /* All other text - make white */
+    .stMarkdown, .stMarkdown * {
+        color: #ffffff !important;
+    }
+    
+    /* Headers and text */
+    h1, h2, h3, h4, h5, h6 {
+        color: #ffffff !important;
+    }
+    
+    p, span, div {
+        color: #ffffff !important;
+    }
+    
+    /* Sidebar text */
+    .css-1d391kg, .css-1d391kg * {
+        color: #ffffff !important;
+    }
+    
+    /* Metrics and values */
+    .metric-container, .metric-container * {
+        color: #ffffff !important;
+    }
+    
+    /* Buttons - keep original colors */
+    .stButton button {
+        color: #ffffff !important;
+    }
+    
+    /* Alerts and info boxes - keep original colors for readability */
+    .stAlert, .stSuccess, .stWarning, .stError, .stInfo {
+        color: #000000 !important;
+    }
+    .stAlert *, .stSuccess *, .stWarning *, .stError *, .stInfo * {
+        color: #000000 !important;
+    }
+    
+    /* DataFrames and tables - keep black text for readability */
+    .stDataFrame, .stDataFrame * {
+        color: #000000 !important;
+    }
+    
+    /* Charts and plots - keep original colors */
+    .plotly, .plotly * {
+        color: #000000 !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -268,24 +576,27 @@ elif page == "📍 Location Prediction":
     col1, col2 = st.columns(2)
     
     with col1:
-        # Get unique states and districts
-        states = df_clean['state'].unique() if df_clean is not None else ['Andhra Pradesh', 'Karnataka', 'Tamil Nadu']
-        districts = df_clean['district'].unique() if df_clean is not None else ['Anantapur', 'Bangalore', 'Chennai']
-        
-        selected_state = st.selectbox("Select State", states)
-        
-        # Filter districts based on state
+        # Get unique states and districts from actual dataset
         if df_clean is not None:
-            state_districts = df_clean[df_clean['state'] == selected_state]['district'].unique()
-        else:
-            state_districts = districts
+            states = sorted(df_clean['state'].unique())
+            selected_state = st.selectbox("Select State", states, key="location_state")
             
-        selected_district = st.selectbox("Select District", state_districts)
+            # Filter districts based on selected state
+            state_districts = sorted(df_clean[df_clean['state'] == selected_state]['district'].unique())
+            selected_district = st.selectbox("Select District", state_districts, key="location_district")
+        else:
+            st.error("Dataset not available. Please ensure the data files are present.")
+            st.stop()
     
     with col2:
         selected_year = st.selectbox("Select Year", range(2024, 2031))
-        crop_preference = st.multiselect("Crop Preference (Optional)", 
-                                       ['Rice', 'Wheat', 'Maize', 'Sugarcane', 'Cotton'])
+        
+        # Get available crops from dataset
+        if df_clean is not None:
+            available_crops = sorted(df_clean['crop'].unique())
+            crop_preference = st.multiselect("Crop Preference (Optional)", available_crops)
+        else:
+            crop_preference = []
     
     # Get location-based recommendations
     if st.button("🔍 Get Recommendations", type="primary"):
@@ -356,200 +667,116 @@ elif page == "📍 Location Prediction":
             st.error("Dataset not available. Please ensure the data files are present.")
 
 elif page == "🔬 Parameter Prediction":
-    st.markdown("# 🔬 Parameter-Based Crop Prediction")
+    st.markdown("# 🔬 Parameter-Based Crop Recommendation")
+    st.markdown("### 🌾 Find the Best Crop for Your Environmental Conditions")
     
-    # Create tabs for different input methods
-    tab1, tab2 = st.tabs(["📝 Manual Input", "📄 Upload Soil Report"])
+    # Create columns for organized input
+    col1, col2 = st.columns(2)
     
-    with tab1:
-        st.markdown("### 🌡️ Enter Your Farm Parameters")
+    with col1:
+        st.markdown("#### 🌱 Soil Conditions")
+        soil_ph = st.slider("Soil pH", 4.5, 9.0, 7.0, 0.1)
+        organic_carbon = st.slider("Organic Carbon %", 0.4, 1.1, 0.7, 0.01)
+        nitrogen = st.slider("Nitrogen (kg/acre)", 161, 416, 200, 1)
+        phosphorus = st.slider("Phosphorus (kg/acre)", 11, 33, 20, 1)
+        potassium = st.slider("Potassium (kg/acre)", 100, 500, 250, 1)
         
-        # Create columns for organized input
-        col1, col2 = st.columns(2)
+        st.markdown("#### 💧 Water Conditions")
+        groundwater_ph = st.slider("Groundwater pH", 6.4, 8.8, 7.5, 0.1)
+        water_hardness = st.slider("Water Hardness (mg/l)", 200, 1000, 400, 10)
+        nitrate_level = st.slider("Nitrate Level (mg/l)", 5, 281, 40, 1)
+        ec_level = st.slider("EC Level (µS/cm)", 650, 2065, 1200, 10)
+    
+    with col2:
+        st.markdown("#### 🌧️ Environmental Conditions")
+        rainfall = st.slider("Expected Rainfall (mm)", 400, 1000, 650, 10)
+        year = st.selectbox("Year", range(2024, 2031))
         
-        with col1:
-            st.markdown("#### 🌱 Soil Conditions")
-            soil_ph = st.slider("Soil pH", 4.5, 9.0, 7.0, 0.1)
-            organic_carbon = st.slider("Organic Carbon %", 0.4, 1.1, 0.7, 0.01)
-            nitrogen = st.slider("Nitrogen (kg/acre)", 161, 416, 200, 1)
-            phosphorus = st.slider("Phosphorus (kg/acre)", 11, 33, 20, 1)
-            potassium = st.slider("Potassium (kg/acre)", 100, 500, 250, 1)
+        st.markdown("#### 🎯 Analysis Method")
+        analysis_method = st.radio(
+            "Choose Analysis Method:",
+            ["ML Models Only", "Historical + ML Models", "Historical Only"],
+            help="ML Models: Uses 8 machine learning models\nHistorical + ML: Combines historical data with ML predictions\nHistorical Only: Uses only historical data analysis"
+        )
+    
+    # Prediction button
+    if st.button("🔮 Find Best Crop", type="primary", use_container_width=True):
+        # Prepare input data (without location and crop)
+        input_data = {
+            'year': year,
+            'groundwater_ph': groundwater_ph,
+            'ec_groundwater_(µs/cm)': ec_level,
+            'hardness_groundwater_(mg/l)': water_hardness,
+            'nitrate_groundwater_(mg/l)': nitrate_level,
+            'rainfall_mm': rainfall,
+            'soil_ph': soil_ph,
+            'soil_organic_carbon': organic_carbon,
+            'soil_nitrogen': nitrogen,
+            'soil_phosphorus': phosphorus,
+            'soil_potassium': potassium
+        }
+        
+        # Get crop recommendations based on analysis method
+        if analysis_method == "ML Models Only":
+            crop_recommendations, crop_predictions = get_crop_recommendations_ml_only(input_data, models, df_clean)
+        elif analysis_method == "Historical + ML Models":
+            crop_recommendations = get_crop_recommendations_combined(input_data, models, df_clean)
+            crop_predictions = None  # Not available for combined method
+        else:  # Historical Only
+            crop_recommendations = get_crop_recommendations_historical(input_data, df_clean)
+            crop_predictions = None  # Not available for historical method
+        
+        if crop_recommendations:
+            # Display results
+            st.markdown("### 🌾 Best Crop Recommendations")
+            st.markdown(f"**Analysis Method:** {analysis_method}")
             
-            st.markdown("#### 💧 Water Conditions")
-            groundwater_ph = st.slider("Groundwater pH", 6.4, 8.8, 7.5, 0.1)
-            water_hardness = st.slider("Water Hardness (mg/l)", 200, 1000, 400, 10)
-            nitrate_level = st.slider("Nitrate Level (mg/l)", 5, 281, 40, 1)
-            ec_level = st.slider("EC Level (µS/cm)", 650, 2065, 1200, 10)
-        
-        with col2:
-            st.markdown("#### 🌧️ Environmental Conditions")
-            rainfall = st.slider("Expected Rainfall (mm)", 400, 1000, 650, 10)
-            year = st.selectbox("Year", range(2024, 2031))
+            # Display top recommended crops
+            for i, (crop, score, confidence, avg_yield, model_count) in enumerate(crop_recommendations[:5], 1):
+                # Get location used for this crop
+                location_used = "N/A"
+                if analysis_method == "ML Models Only":
+                    # Find the location used for this crop
+                    for crop_name, data in crop_predictions.items():
+                        if crop_name == crop:
+                            location_used = data.get('location_used', 'N/A')
+                            break
+                
+                with st.container():
+                    st.markdown(f"""
+                    <div class="prediction-card">
+                        <h4>#{i} {crop}</h4>
+                        <p><strong>Score:</strong> {score:.1f}%</p>
+                        <p><strong>Predicted Yield:</strong> {avg_yield:.1f} kg/acre</p>
+                        <p><strong>Confidence:</strong> {confidence}</p>
+                        <p><strong>Models Used:</strong> {model_count}</p>
+                        <p><strong>Location Context:</strong> {location_used}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
             
-            st.markdown("#### 📍 Location")
-            state = st.selectbox("State", df_clean['state'].unique() if df_clean is not None else ['Andhra Pradesh'])
-            district = st.selectbox("District", df_clean['district'].unique() if df_clean is not None else ['Anantapur'])
-            crop = st.selectbox("Crop Type", df_clean['crop'].unique() if df_clean is not None else ['Rice'])
-        
-        # Prediction button
-        if st.button("🔮 Predict Yield", type="primary", use_container_width=True):
-            # Prepare input data
-            input_data = {
-                'state': state,
-                'district': district,
-                'year': year,
-                'crop': crop,
-                'groundwater_ph': groundwater_ph,
-                'ec_groundwater_(µs/cm)': ec_level,
-                'hardness_groundwater_(mg/l)': water_hardness,
-                'nitrate_groundwater_(mg/l)': nitrate_level,
-                'rainfall_mm': rainfall,
-                'soil_ph': soil_ph,
-                'soil_organic_carbon': organic_carbon,
-                'soil_nitrogen': nitrogen,
-                'soil_phosphorus': phosphorus,
-                'soil_potassium': potassium
+            # Create visualization
+            crop_df = pd.DataFrame(crop_recommendations[:5], columns=['Crop', 'Score', 'Confidence', 'Avg_Yield', 'Model_Count'])
+            fig = px.bar(crop_df, x='Crop', y='Score',
+                        title=f"Crop Recommendations ({analysis_method})",
+                        labels={'Score': 'Score (%)', 'Crop': 'Crop Type'})
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Detailed comparison table
+            st.markdown("#### 📊 Detailed Comparison")
+            comparison_df = pd.DataFrame(crop_recommendations, columns=['Crop', 'Score', 'Confidence', 'Avg_Yield', 'Model_Count'])
+            st.dataframe(comparison_df, use_container_width=True)
+            
+            # Save prediction
+            prediction = {
+                'type': 'parameter_crop_recommendation',
+                'parameters': input_data,
+                'analysis_method': analysis_method,
+                'recommendations': crop_recommendations
             }
+            st.session_state.predictions_history.append(prediction)
             
-            # Create DataFrame
-            input_df = pd.DataFrame([input_data])
-            
-            # Normalize data (simplified - in real app, use proper scaler)
-            numeric_cols = ['groundwater_ph', 'ec_groundwater_(µs/cm)', 'hardness_groundwater_(mg/l)',
-                           'nitrate_groundwater_(mg/l)', 'rainfall_mm', 'soil_ph',
-                           'soil_organic_carbon', 'soil_nitrogen', 'soil_phosphorus', 'soil_potassium']
-            
-            # One-hot encode categorical variables
-            input_encoded = pd.get_dummies(input_df, columns=['state', 'district', 'crop'], drop_first=True)
-            
-            # Load feature info if available
-            feature_info = None
-            try:
-                with open('notebooks/feature_info.pkl', 'rb') as f:
-                    feature_info = pickle.load(f)
-            except:
-                pass
-            
-            if feature_info:
-                # Use the exact feature columns from training
-                expected_columns = feature_info['feature_columns']
-                
-                # Add missing columns with 0
-                for col in expected_columns:
-                    if col not in input_encoded.columns:
-                        input_encoded[col] = 0
-                
-                # Reorder columns to match training data exactly
-                input_encoded = input_encoded[expected_columns]
-                
-                st.info(f"📊 Using {len(expected_columns)} features as expected by models")
-            elif df is not None:
-                # Fallback to original method
-                training_cols = [col for col in df.columns if col != 'crop_yield']
-                
-                # Add missing columns with 0
-                for col in training_cols:
-                    if col not in input_encoded.columns:
-                        input_encoded[col] = 0
-                
-                # Reorder columns to match training data
-                input_encoded = input_encoded[training_cols]
-            else:
-                st.error("No training data or feature info available")
-                st.stop()
-            
-            # Make predictions with all available models
-            predictions = {}
-            for model_name, model in models.items():
-                try:
-                    if model_name in ['MLP', 'SVR'] and isinstance(model, dict):
-                        # Handle models with scalers
-                        scaler = model.get('scaler')
-                        model_obj = model.get('model')
-                        if scaler and model_obj:
-                            input_scaled = scaler.transform(input_encoded)
-                            pred = model_obj.predict(input_scaled)[0]
-                        else:
-                            pred = model.predict(input_encoded)[0]
-                    else:
-                        pred = model.predict(input_encoded)[0]
-                    predictions[model_name] = pred
-                except Exception as e:
-                    st.warning(f"Error with {model_name}: {str(e)}")
-            
-            if predictions:
-                # Display results
-                st.markdown("### 🎯 Prediction Results")
-                
-                # Average prediction
-                avg_prediction = np.mean(list(predictions.values()))
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Predicted Yield", f"{avg_prediction:.1f} kg/acre")
-                with col2:
-                    st.metric("Confidence", "High" if len(predictions) > 3 else "Medium")
-                with col3:
-                    st.metric("Models Used", len(predictions))
-                
-                # Individual model predictions
-                st.markdown("#### 📊 Model-wise Predictions")
-                pred_df = pd.DataFrame(list(predictions.items()), columns=['Model', 'Prediction'])
-                fig = px.bar(pred_df, x='Model', y='Prediction', 
-                           title="Predictions by Different Models")
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # SHAP explanation (if available)
-                if SHAP_AVAILABLE and MATPLOTLIB_AVAILABLE and 'Random Forest' in models:
-                    try:
-                        st.markdown("#### 🔍 Feature Importance (SHAP)")
-                        explainer = shap.TreeExplainer(models['Random Forest'])
-                        shap_values = explainer.shap_values(input_encoded)
-                        
-                        # Create SHAP summary plot
-                        fig, ax = plt.subplots(figsize=(10, 6))
-                        shap.summary_plot(shap_values, input_encoded, show=False)
-                        st.pyplot(fig)
-                    except Exception as e:
-                        st.warning(f"SHAP explanation not available: {str(e)}")
-                elif not SHAP_AVAILABLE:
-                    st.info("SHAP not available. Install with: pip install shap")
-                
-                # Save prediction
-                prediction = {
-                    'type': 'parameter',
-                    'parameters': input_data,
-                    'predicted_yield': avg_prediction,
-                    'model_predictions': predictions
-                }
-                st.session_state.predictions_history.append(prediction)
-                
-            else:
-                st.error("No models available for prediction.")
         else:
-            st.error("Training data not available.")
-    
-    with tab2:
-        st.markdown("### 📄 Upload Soil Test Report")
-        uploaded_file = st.file_uploader("Choose a file", type=['csv', 'xlsx'])
-        
-        if uploaded_file is not None:
-            try:
-                if uploaded_file.name.endswith('.csv'):
-                    data = pd.read_csv(uploaded_file)
-                else:
-                    data = pd.read_excel(uploaded_file)
-                
-                st.success("File uploaded successfully!")
-                st.dataframe(data.head())
-                
-                # Process uploaded data
-                if st.button("🔮 Predict from Uploaded Data"):
-                    st.info("Processing uploaded data...")
-                    # Add processing logic here
-                    
-            except Exception as e:
-                st.error(f"Error processing file: {str(e)}")
+            st.error("Unable to generate crop recommendations. Please check your input parameters.")
 
 elif page == "📊 Analytics Dashboard":
     st.markdown("# 📊 Analytics Dashboard")
