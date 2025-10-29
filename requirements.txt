@@ -12,3 +12,5 @@ catboost
 lightgbm
 pytorch_tabnet
 pytorch_tabular
+google-generativeai
+python-dotenv
