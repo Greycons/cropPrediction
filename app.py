@@ -19,7 +19,7 @@ try:
 except ImportError:
     DOTENV_AVAILABLE = False
 
-# Try to import Gemini
+# Try to import and configure Gemini
 try:
     import google.generativeai as genai
     GEMINI_AVAILABLE = True
@@ -28,10 +28,21 @@ try:
     # Configure Gemini API - Check both environment variable and .env file
     api_key = os.environ.get('GOOGLE_API_KEY')
     if api_key:
-        genai.configure(
-            api_key=api_key,
-            client_options={"api_endpoint": "https://generativelanguage.googleapis.com/v1"}
-        )
+        # Configure with simplified settings
+        genai.configure(api_key=api_key)
+        
+        # Verify the configuration by testing model creation
+        try:
+            # Try to create a model instance
+            model = genai.GenerativeModel('gemini-pro')
+            # Test with a simple prompt
+            response = model.generate_content("Test connection")
+            if not response:
+                GEMINI_AVAILABLE = False
+                GEMINI_REASON = "Could not generate response from Gemini model"
+        except Exception as e:
+            GEMINI_AVAILABLE = False
+            GEMINI_REASON = f"Error connecting to Gemini: {str(e)}"
     else:
         GEMINI_AVAILABLE = False
         if not DOTENV_AVAILABLE:
@@ -40,7 +51,7 @@ try:
             GEMINI_REASON = "GOOGLE_API_KEY not found in environment or .env file"
 except ImportError:
     GEMINI_AVAILABLE = False
-    GEMINI_REASON = "google-generativeai not installed"
+    GEMINI_REASON = "google-generativeai package not installed. Run: pip install google-generativeai"
     genai = None
 
 # Try to import shap, but handle if not available
@@ -60,125 +71,289 @@ except ImportError:
 
 # Helper functions
 def generate_ai_response(prompt, location=None, soil_params=None, df_clean=None):
-    """Generate AI response using Gemini LLM with context from ML models and dataset"""
-    
-    # Use Gemini AI for actual responses
-    try:
-        # Build context with ML model data
-        context_parts = """You are an expert agricultural AI assistant helping farmers with crop predictions, soil health, and farming best practices. 
-        
-You have access to:
-1. Machine learning models trained on agricultural data
-2. Historical crop yield data
-3. Soil and environmental parameters
-4. Location-based recommendations
+    """Generate AI response using Google's Gemini Pro with context from ML models and dataset.
 
-Guidelines:
-- Provide evidence-based advice using the data provided
-- Consider soil parameters, location, and environmental conditions
-- Suggest specific crops, practices, and improvements
-- Use emojis where appropriate
-- Be concise but informative (2-4 paragraphs typically)
-"""
-        
-        # Add location context if available
-        if location:
-            context_parts += f"\n📍 **Location Context**: {location['state']}, {location['district']}"
-            if df_clean is not None:
-                location_data = df_clean[
-                    (df_clean['state'] == location['state']) & 
-                    (df_clean['district'] == location['district'])
-                ]
-                if len(location_data) > 0:
-                    avg_yield = location_data['crop_yield'].mean()
-                    top_crops = location_data.groupby('crop')['crop_yield'].mean().sort_values(ascending=False).head(3)
-                    context_parts += f"\n   - Average crop yield in this area: {avg_yield:.1f} kg/acre"
-                    context_parts += f"\n   - Top crops: {', '.join(top_crops.index.tolist())}"
-                    context_parts += f"\n   - Total records available: {len(location_data)}"
-        
-        # Add soil context if available
-        if soil_params:
-            context_parts += f"\n🌱 **Soil Parameters**: "
-            context_parts += f"pH={soil_params.get('soil_ph', 'N/A')}, "
-            context_parts += f"Nitrogen={soil_params.get('soil_nitrogen', 'N/A')}, "
-            context_parts += f"Phosphorus={soil_params.get('soil_phosphorus', 'N/A')}, "
-            context_parts += f"Potassium={soil_params.get('soil_potassium', 'N/A')}, "
-            context_parts += f"Organic Carbon={soil_params.get('soil_organic_carbon', 'N/A')}"
-            
-        # Add dataset information
-        if df_clean is not None:
-            available_crops = sorted(df_clean['crop'].unique())
-            context_parts += f"\n📊 **Available in Dataset**: {len(available_crops)} crop types including: {', '.join(available_crops[:10])}"
-        
-        context_parts += "\n\nUser's question: "
-        
-        # Create full context
-        context = context_parts
-        
-        # Try free-tier compatible models in order
-        candidate_models = [
-            'gemini-1.5-flash',          # fast, generally free-tier
-            # 'gemini-1.5-flash-8b',       # smaller, cheaper
-            # 'gemini-1.5-pro'             # higher quality, may be limited
-        ]
-        last_error = None
-        full_prompt = context + prompt
-        for model_name in candidate_models:
+    The function builds a short, structured context from provided location/soil/dataset
+    information and sends a single generation request to the Gemini Pro model. It
+    returns the model text on success or a friendly error message on failure.
+    """
+
+    if not GEMINI_AVAILABLE:
+        return (
+            "🔑 **Gemini API Setup Required**\n\n"
+            "Please set up Google's Gemini API:\n"
+            "1. Get an API key from Google AI Studio\n"
+            "2. Add to your `.env` file:\n"
+            "   GOOGLE_API_KEY=your_key_here\n"
+            "3. Install required package: `pip install google-generativeai`\n"
+            "4. Restart the Streamlit app\n\n"
+            f"Current Status: {GEMINI_REASON or 'Unknown error'}"
+        )
+
+    # Build a concise context
+    context_parts = [
+        "You are an expert agricultural AI assistant helping farmers with crop predictions, soil health, and farming best practices."
+        " Be concise, actionable, and use emojis where appropriate."
+    ]
+
+    if location and df_clean is not None:
+        try:
+            location_data = df_clean[
+                (df_clean['state'] == location['state']) & (df_clean['district'] == location['district'])
+            ]
+            if len(location_data) > 0:
+                avg_yield = location_data['crop_yield'].mean()
+                top_crops = location_data.groupby('crop')['crop_yield'].mean().sort_values(ascending=False).head(3)
+                context_parts.append(f"📍 Location: {location['state']}, {location['district']}")
+                context_parts.append(f"- Avg yield: {avg_yield:.1f} kg/acre")
+                context_parts.append(f"- Top crops: {', '.join(top_crops.index.tolist())}")
+            else:
+                context_parts.append(f"📍 Location: {location['state']}, {location['district']} (no historical rows)")
+        except Exception:
+            # Non-fatal — continue without location-specific stats
+            context_parts.append(f"📍 Location: {location.get('state')}, {location.get('district')}")
+
+    if soil_params:
+        soil_lines = ["🌱 Soil Parameters:"]
+        for param, value in soil_params.items():
+            pretty = param.replace('soil_', '').replace('_', ' ').title()
+            soil_lines.append(f"- {pretty}: {value}")
+        context_parts.append('\n'.join(soil_lines))
+
+    if df_clean is not None:
+        context_parts.append(f"📊 Historical records: {len(df_clean)} rows; {df_clean['crop'].nunique()} crops; {df_clean['state'].nunique()} states")
+
+    # Final prompt
+    full_prompt = "\n\n".join(context_parts) + "\n\nUser Question: " + prompt
+
+    # Send to Gemini
+    try:
+        model = genai.GenerativeModel('gemini-pro')
+        response = model.generate_content(
+            full_prompt,
+            generation_config={
+                'temperature': 0.7,
+                'top_p': 0.8,
+                'top_k': 40,
+                'max_output_tokens': 800,
+            }
+        )
+
+        # Some SDK responses put text in .text, others in .content; handle both
+        if hasattr(response, 'text') and response.text:
+            return response.text
+        if hasattr(response, 'content'):
+            # content may be a dict or list depending on SDK version
             try:
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(
-                    full_prompt,
-                    generation_config=genai.types.GenerationConfig(
-                        temperature=0.7,
-                        top_p=0.8,
-                        top_k=40,
-                        max_output_tokens=1024,
-                    ),
-                    request_options={"timeout": 20}
-                )
-                return response.text
-            except Exception as model_err:
-                last_error = str(model_err)
-                continue
-        
-        # If all models failed, raise to outer handler
-        raise RuntimeError(last_error or 'Unknown error while calling Gemini API')
-        
+                if isinstance(response.content, dict):
+                    return response.content.get('output', '') or str(response.content)
+                return str(response.content)
+            except Exception:
+                return str(response.content)
+
+        return str(response)
+
     except Exception as e:
-        # Fallback to simple response if API fails
-        error_msg = str(e) if len(str(e)) < 100 else str(e)[:100] + "..."
-        return f"""
-        🤖 **AI Service Unavailable**
-        
-        I'm having trouble connecting to the AI service. 
-        
-        Please try again later or check:
-        - Your internet connection
-        - Your API key is valid
-        
-        **Error**: {error_msg}
-        
-        In the meantime, you can ask me about:
-        - Soil health and pH management
-        - Crop selection and yield optimization
-        - Weather and rainfall considerations
-        - Farming best practices
-        """
+        return (
+            "🤖 **AI Assistant Error**\n\n"
+            "I encountered an error while processing your request:\n"
+            f"{str(e)}\n\n"
+            "Please try again or check:\n"
+            "- Your internet connection\n"
+            "- API key configuration\n"
+            "- Gemini API status"
+        )
 
 def get_crop_recommendations_ml_only(input_data, models, df_clean, state_override=None, district_override=None):
     """Get crop recommendations using only ML models.
     If state_override and district_override are provided, use that location for all crops.
+    Returns (crop_scores, crop_predictions) where crop_scores is a sorted list of tuples
+    and crop_predictions is a dict of per-crop prediction details.
     """
-    
     if df_clean is None or not models:
         return None
-    
-    # Get available crops from the dataset
+
     available_crops = df_clean['crop'].unique()
-    
-    # Store predictions for each crop
     crop_predictions = {}
-    
+
+    for crop in available_crops:
+        if state_override is not None and district_override is not None:
+            state = state_override
+            district = district_override
+        else:
+            crop_data = df_clean[df_clean['crop'] == crop]
+            if len(crop_data) > 0:
+                location_counts = crop_data.groupby(['state', 'district']).size().reset_index(name='count')
+                most_common_location = location_counts.loc[location_counts['count'].idxmax()]
+                state = most_common_location['state']
+                district = most_common_location['district']
+            else:
+                state = df_clean['state'].iloc[0]
+                district = df_clean['district'].iloc[0]
+
+        test_input = input_data.copy()
+        test_input['state'] = state
+        test_input['district'] = district
+        test_input['crop'] = crop
+
+        input_df = pd.DataFrame([test_input])
+        input_encoded = pd.get_dummies(input_df, columns=['state', 'district', 'crop'], drop_first=True)
+
+        feature_info = None
+        try:
+            with open('notebooks/feature_info.pkl', 'rb') as f:
+                feature_info = pickle.load(f)
+        except Exception:
+            feature_info = None
+
+        if feature_info:
+            expected_columns = feature_info.get('feature_columns', [])
+            for col in expected_columns:
+                if col not in input_encoded.columns:
+                    input_encoded[col] = 0
+            input_encoded = input_encoded[expected_columns]
+
+        crop_model_predictions = []
+        working_models = 0
+
+        for model_name, model in models.items():
+            if model_name != 'Random Forest':
+                continue
+            try:
+                if isinstance(model, dict) and 'model' in model:
+                    scaler = model.get('scaler')
+                    model_obj = model['model']
+                    if scaler and model_obj:
+                        input_scaled = scaler.transform(input_encoded)
+                        pred = model_obj.predict(input_scaled)[0]
+                    else:
+                        pred = model_obj.predict(input_encoded)[0]
+                else:
+                    pred = model.predict(input_encoded)[0]
+                crop_model_predictions.append(pred)
+                working_models += 1
+            except Exception:
+                continue
+
+        if crop_model_predictions:
+            avg_prediction = np.mean(crop_model_predictions)
+            crop_predictions[crop] = {
+                'avg_yield': avg_prediction,
+                'model_count': working_models,
+                'individual_predictions': crop_model_predictions,
+                'location_used': f"{state}, {district}"
+            }
+
+    if not crop_predictions:
+        return None
+
+    yields = [data['avg_yield'] for data in crop_predictions.values()]
+    min_yield = min(yields)
+    max_yield = max(yields)
+
+    crop_scores = []
+    for crop, data in crop_predictions.items():
+        if max_yield > min_yield:
+            score = ((data['avg_yield'] - min_yield) / (max_yield - min_yield)) * 100
+        else:
+            score = 50
+
+        if data['model_count'] >= 6:
+            confidence = "High"
+        elif data['model_count'] >= 4:
+            confidence = "Medium"
+        else:
+            confidence = "Low"
+
+        crop_scores.append((crop, score, confidence, data['avg_yield'], data['model_count']))
+
+    crop_scores.sort(key=lambda x: x[1], reverse=True)
+    return crop_scores, crop_predictions
+
+def get_crop_recommendations_combined(input_data, models, df_clean):
+    """Combine ML and historical recommendations (weighted)."""
+    ml_result = get_crop_recommendations_ml_only(input_data, models, df_clean)
+    if ml_result is None:
+        return None
+    ml_recommendations, _ = ml_result
+
+    historical_recommendations = get_crop_recommendations_historical(input_data, df_clean)
+    if historical_recommendations is None:
+        return ml_recommendations
+
+    combined_scores = []
+    for crop, ml_score, ml_conf, ml_yield, ml_count in ml_recommendations:
+        hist = next((h for h in historical_recommendations if h[0] == crop), None)
+        if hist:
+            hist_score, hist_yield = hist[1], hist[3]
+            combined_score = (ml_score * 0.7) + (hist_score * 0.3)
+            combined_yield = (ml_yield * 0.7) + (hist_yield * 0.3)
+        else:
+            combined_score = ml_score * 0.8
+            combined_yield = ml_yield
+
+        if ml_count >= 6 and hist:
+            confidence = "High"
+        elif ml_count >= 4:
+            confidence = "Medium"
+        else:
+            confidence = "Low"
+
+        combined_scores.append((crop, combined_score, confidence, combined_yield, ml_count))
+
+    combined_scores.sort(key=lambda x: x[1], reverse=True)
+    return combined_scores
+
+def get_crop_recommendations_historical(input_data, df_clean):
+    """Get crop recommendations using historical data analysis."""
+    if df_clean is None:
+        return None
+
+    filtered_data = df_clean.copy()
+    tolerance = 0.1
+    try:
+        filtered_data = filtered_data[
+            (filtered_data['soil_ph'] >= input_data['soil_ph'] * (1 - tolerance)) &
+            (filtered_data['soil_ph'] <= input_data['soil_ph'] * (1 + tolerance)) &
+            (filtered_data['rainfall_mm'] >= input_data['rainfall_mm'] * (1 - tolerance)) &
+            (filtered_data['rainfall_mm'] <= input_data['rainfall_mm'] * (1 + tolerance)) &
+            (filtered_data['soil_nitrogen'] >= input_data['soil_nitrogen'] * (1 - tolerance)) &
+            (filtered_data['soil_nitrogen'] <= input_data['soil_nitrogen'] * (1 + tolerance))
+        ]
+    except Exception:
+        # If filtering fails because columns missing, fallback to full data
+        filtered_data = df_clean
+
+    if len(filtered_data) == 0:
+        filtered_data = df_clean
+
+    crop_performance = filtered_data.groupby('crop')['crop_yield'].agg(['mean', 'count']).reset_index()
+    crop_performance = crop_performance.sort_values('mean', ascending=False)
+
+    yields = crop_performance['mean'].values
+    min_yield = float(min(yields)) if len(yields) > 0 else 0.0
+    max_yield = float(max(yields)) if len(yields) > 0 else 0.0
+
+    historical_scores = []
+    for _, row in crop_performance.iterrows():
+        crop = row['crop']
+        avg_yield = row['mean']
+        count = int(row['count'])
+        if max_yield > min_yield:
+            score = ((avg_yield - min_yield) / (max_yield - min_yield)) * 100
+        else:
+            score = 50
+
+        if count >= 20:
+            confidence = "High"
+        elif count >= 10:
+            confidence = "Medium"
+        else:
+            confidence = "Low"
+
+        historical_scores.append((crop, score, confidence, avg_yield, count))
+
+    return historical_scores
     # Test each crop with the given parameters
     for crop in available_crops:
         # Use explicit location if provided, otherwise find the most common location for this crop
@@ -838,8 +1013,44 @@ if page == "🏠 Home":
     if st.session_state.predictions_history:
         st.markdown("### 📋 Recent Predictions")
         for i, pred in enumerate(st.session_state.predictions_history[-3:]):
-            with st.expander(f"Prediction #{len(st.session_state.predictions_history)-i}"):
-                st.json(pred)
+            prediction_num = len(st.session_state.predictions_history) - i
+            with st.expander(f"Prediction #{prediction_num}"):
+                if pred['type'] == 'location_rf_top3':
+                    st.markdown(f"""
+                    **Location-Based Prediction**
+                    📍 Location: {pred['state']}, {pred['district']}
+                    
+                    **Top Recommended Crops:**
+                    1. {pred['top3'][0]['crop']} — {pred['top3'][0]['predicted_yield']:.1f} kg/acre
+                    2. {pred['top3'][1]['crop']} — {pred['top3'][1]['predicted_yield']:.1f} kg/acre
+                    3. {pred['top3'][2]['crop']} — {pred['top3'][2]['predicted_yield']:.1f} kg/acre
+                    """)
+                elif pred['type'] == 'parameter_rf_top3':
+                    params = pred['parameters']
+                    st.markdown(f"""
+                    **Parameter-Based Prediction**
+                    
+                    🌱 **Soil Parameters:**
+                    - pH: {params['soil_ph']:.1f}
+                    - Nitrogen: {params['soil_nitrogen']:.0f} kg/acre
+                    - Phosphorus: {params['soil_phosphorus']:.0f} kg/acre
+                    - Potassium: {params['soil_potassium']:.0f} kg/acre
+                    - Organic Carbon: {params['soil_organic_carbon']:.2f}%
+                    
+                    💧 **Water Conditions:**
+                    - Groundwater pH: {params['groundwater_ph']:.1f}
+                    - Water Hardness: {params['hardness_groundwater_(mg/l)']:.0f} mg/l
+                    - Nitrate Level: {params['nitrate_groundwater_(mg/l)']:.0f} mg/l
+                    - EC Level: {params['ec_groundwater_(µs/cm)']:.0f} µS/cm
+                    
+                    🌧️ **Environmental:**
+                    - Rainfall: {params['rainfall_mm']:.0f} mm
+                    
+                    **Top Recommended Crops:**
+                    1. {pred['top3'][0]['crop']} — {pred['top3'][0]['predicted_yield']:.1f} kg/acre
+                    2. {pred['top3'][1]['crop']} — {pred['top3'][1]['predicted_yield']:.1f} kg/acre
+                    3. {pred['top3'][2]['crop']} — {pred['top3'][2]['predicted_yield']:.1f} kg/acre
+                    """)
 
 elif page == "📍 Location Prediction":
     st.markdown("# 📍 Location-Based Crop Prediction")
@@ -1097,34 +1308,31 @@ elif page == "📊 Analytics Dashboard":
 elif page == "💬 AI Assistant":
     st.markdown("# 💬 AI Assistant")
     
-    # Show API key setup if not available
+    # Show API key setup if Gemini is not available
     if not GEMINI_AVAILABLE:
-        st.warning(f"⚠️ **AI Assistant unavailable**: {GEMINI_REASON}")
+        st.warning("⚠️ **AI Assistant requires Google Gemini API setup**")
         
         with st.expander("🔑 Setup Instructions (Click to expand)", expanded=True):
             st.markdown(f"""
-            ### Current Issue:
-            **{GEMINI_REASON}**
+            ### To set up the AI Assistant:
             
-            ### To set up Gemini AI Assistant:
-            
-            1. **Install required packages**:
+            1. **Install required package**:
                ```bash
-               pip install google-generativeai python-dotenv
+               pip install google-generativeai
                ```
             
             2. **Get your API key** from [Google AI Studio](https://makersuite.google.com/app/apikey)
             
             3. **Create a `.env` file** in the project root with:
                ```env
-               GOOGLE_API_KEY=your_api_key_here
+               GOOGLE_API_KEY=your_key_here
                ```
             
             4. **Restart the Streamlit app**
             
             **Example `.env` file location**: Create a file named `.env` in the same directory as `app.py`
             
-            **Note**: The app will use local fallback responses if the API key is not set.
+            **Current Status**: {GEMINI_REASON or "Unknown error"}
             """)
     
     # Chat interface
@@ -1285,18 +1493,19 @@ elif page == "🔍 Model Details":
             
             # Metrics
             st.markdown("### 📐 Metrics")
-            metrics_all = evaluate_all_models(models, df_clean)
+            # Prefer a precomputed metrics file (useful for stable display / CI)
+            metrics_all = load_model_metrics_file()
+            if metrics_all is None:
+                metrics_all = evaluate_all_models(models, df_clean)
             if metrics_all and selected_model in metrics_all:
                 m = metrics_all[selected_model]
-                col1, col2, col3, col4 = st.columns(4)
+                col1, col2, col3 = st.columns(3)
                 with col1:
                     st.metric("R²", f"{m.get('r2', 0):.3f}")
                 with col2:
                     st.metric("MAE", f"{m.get('mae', 0):.2f}")
                 with col3:
                     st.metric("RMSE", f"{m.get('rmse', 0):.2f}")
-                with col4:
-                    st.metric("MAPE", f"{m.get('mape', 0):.1f}%")
             else:
                 st.info("Computing metrics...")
                 # Simple fallback metrics
@@ -1312,33 +1521,14 @@ elif page == "🔍 Model Details":
                         'Model': name,
                         'R2': vals.get('r2', 0),
                         'MAE': vals.get('mae', 0),
-                        'RMSE': vals.get('rmse', 0),
-                        'MAPE_%': vals.get('mape', 0),
-                        'Samples': vals.get('n_samples', 0)
+                        'RMSE': vals.get('rmse', 0)
                     } for name, vals in metrics_all.items() if isinstance(vals, dict)
                 ])
                 if not df_metrics.empty and 'R2' in df_metrics.columns:
                     df_metrics = df_metrics.sort_values('R2', ascending=False)
                 st.dataframe(df_metrics, use_container_width=True)
             
-            # Model insights
-            st.markdown("### 🧠 Model Insights")
-            # Handle both wrapped and direct model formats
-            if isinstance(model_obj, dict) and 'model' in model_obj:
-                core_model = model_obj['model']
-            else:
-                core_model = model_obj
-            if hasattr(core_model, 'feature_importances_'):
-                importances = getattr(core_model, 'feature_importances_')
-                if feature_names is not None and len(feature_names) == len(importances):
-                    imp_df = pd.DataFrame({'Feature': feature_names, 'Importance': importances})
-                else:
-                    imp_df = pd.DataFrame({'Feature': [f'F{i}' for i in range(len(importances))], 'Importance': importances})
-                imp_df = imp_df.sort_values('Importance', ascending=False).head(20)
-                fig = px.bar(imp_df, x='Feature', y='Importance', title=f"{selected_model} Feature Importances")
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Feature importances not available for this model.")
+            # Model insights removed per user request
             
             # Per-crop average yield overview for context
             if df_clean is not None:
