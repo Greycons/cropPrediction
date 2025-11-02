@@ -239,3 +239,114 @@ def format_prediction_result(prediction, confidence_level="High"):
             'model_count': 1,
             'individual_predictions': {'Single Model': prediction}
         }
+
+def get_fertilizer_recommendations(soil_params):
+    """Generate fertilizer recommendations based on soil parameters"""
+    recommendations = []
+    
+    # Nitrogen recommendations
+    nitrogen = soil_params.get('soil_nitrogen', 0)
+    if nitrogen < 140:  # Low nitrogen
+        recommendations.append({
+            'nutrient': 'Nitrogen',
+            'status': 'Low',
+            'fertilizers': [
+                'Urea (46-0-0)',
+                'Ammonium Sulfate (21-0-0)',
+                'NPK (20-20-20)'
+            ],
+            'organic_options': [
+                'Composted Manure',
+                'Blood Meal',
+                'Fish Emulsion'
+            ]
+        })
+    
+    # Phosphorus recommendations
+    phosphorus = soil_params.get('soil_phosphorus', 0)
+    if phosphorus < 10:  # Low phosphorus
+        recommendations.append({
+            'nutrient': 'Phosphorus',
+            'status': 'Low',
+            'fertilizers': [
+                'Triple Superphosphate (0-45-0)',
+                'DAP (18-46-0)',
+                'NPK (10-30-10)'
+            ],
+            'organic_options': [
+                'Bone Meal',
+                'Rock Phosphate',
+                'Fish Bone Meal'
+            ]
+        })
+    
+    # Potassium recommendations
+    potassium = soil_params.get('soil_potassium', 0)
+    if potassium < 200:  # Low potassium
+        recommendations.append({
+            'nutrient': 'Potassium',
+            'status': 'Low',
+            'fertilizers': [
+                'Potassium Chloride (0-0-60)',
+                'Potassium Sulfate (0-0-50)',
+                'NPK (13-13-21)'
+            ],
+            'organic_options': [
+                'Wood Ash',
+                'Kelp Meal',
+                'Greensand'
+            ]
+        })
+    
+    # pH adjustment recommendations
+    soil_ph = soil_params.get('soil_ph', 7.0)
+    if soil_ph < 6.0:
+        recommendations.append({
+            'nutrient': 'pH (Acidic)',
+            'status': 'Low',
+            'adjustments': [
+                'Agricultural Lime',
+                'Dolomitic Limestone',
+                'Wood Ash'
+            ],
+            'notes': 'Apply lime based on soil test recommendations'
+        })
+    elif soil_ph > 7.5:
+        recommendations.append({
+            'nutrient': 'pH (Alkaline)',
+            'status': 'High',
+            'adjustments': [
+                'Sulfur',
+                'Aluminum Sulfate',
+                'Iron Sulfate'
+            ],
+            'notes': 'Apply amendments based on soil test recommendations'
+        })
+    
+    return recommendations
+
+def explain_crop_prediction(crop, yield_prediction, shap_values, input_data, feature_names):
+    """Generate a natural language explanation for crop recommendation using SHAP values"""
+    explanation_parts = []
+    
+    # Start with the crop and predicted yield
+    explanation_parts.append(f"🌱 {crop} is recommended with an expected yield of {yield_prediction:.1f} kg/acre.")
+    
+    # Add SHAP explanations for top factors
+    if shap_values is not None and feature_names is not None:
+        # Convert SHAP values to a dictionary of feature importances
+        feature_importance = {}
+        if isinstance(shap_values, np.ndarray):
+            for idx, name in enumerate(feature_names):
+                feature_importance[name] = abs(shap_values[0][idx])
+        
+        # Get top 3 most influential factors
+        sorted_factors = sorted(feature_importance.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
+        
+        explanation_parts.append("\n\n📊 Key factors influencing this prediction:")
+        for factor, importance in sorted_factors:
+            pretty_name = factor.replace('soil_', '').replace('_', ' ').title()
+            impact = "positive" if importance > 0 else "negative"
+            explanation_parts.append(f"- {pretty_name}: {abs(importance):.2f} ({impact} impact)")
+    
+    return "\n".join(explanation_parts)

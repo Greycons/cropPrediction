@@ -8,6 +8,11 @@ import pickle
 import warnings
 import os
 import re
+import json
+import matplotlib.pyplot as plt
+from utils import (load_models, prepare_input_data, make_prediction, get_feature_importance,
+                  get_shap_explanation, create_shap_plot, explain_crop_prediction,
+                  get_crop_specific_advice, get_fertilizer_recommendations)
 warnings.filterwarnings('ignore')
 
 # Try to import dotenv for .env file support
@@ -31,15 +36,37 @@ try:
         # Configure with simplified settings
         genai.configure(api_key=api_key)
         
-        # Verify the configuration by testing model creation
+        # Verify the configuration by testing model creation with model list
         try:
-            # Try to create a model instance
-            model = genai.GenerativeModel('gemini-pro')
-            # Test with a simple prompt
-            response = model.generate_content("Test connection")
-            if not response:
+            # List available models first
+            available_models = [model.name for model in genai.list_models()]
+            # Try to find best available model (Gemini 2.5 Flash variants only)
+            model_name = None
+            candidates = [
+                'gemini-2.5-flash',
+                'gemini-2.5-flash-latest',
+                'gemini-2.5-flash-preview-09-2025',
+                'gemini-2.5-flash-preview-05-20',
+                'gemini-2.5-flash-lite',
+                'gemini-2.5-flash-lite-preview-09-2025',
+                'gemini-flash-latest',
+                'gemini-flash'
+            ]
+            for candidate in candidates:
+                if f"models/{candidate}" in available_models:
+                    model_name = candidate
+                    break
+            
+            if not model_name:
                 GEMINI_AVAILABLE = False
-                GEMINI_REASON = "Could not generate response from Gemini model"
+                GEMINI_REASON = f"No supported Gemini model found. Available models: {', '.join(available_models)}"
+            else:
+                # Try a test generation with the found model
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content("Test connection")
+                if not response:
+                    GEMINI_AVAILABLE = False
+                    GEMINI_REASON = f"Could not generate response from Gemini model {model_name}"
         except Exception as e:
             GEMINI_AVAILABLE = False
             GEMINI_REASON = f"Error connecting to Gemini: {str(e)}"
@@ -126,9 +153,31 @@ def generate_ai_response(prompt, location=None, soil_params=None, df_clean=None)
     # Final prompt
     full_prompt = "\n\n".join(context_parts) + "\n\nUser Question: " + prompt
 
-    # Send to Gemini
+    # Send to Gemini with best available model
     try:
-        model = genai.GenerativeModel('gemini-pro')
+        # Use same model discovery logic as in configuration
+        available_models = [model.name for model in genai.list_models()]
+        model_name = None
+        # Prefer Gemini 2.5 Flash family only
+        candidates = [
+            'gemini-2.5-flash',
+            'gemini-2.5-flash-latest',
+            'gemini-2.5-flash-preview-09-2025',
+            'gemini-2.5-flash-preview-05-20',
+            'gemini-2.5-flash-lite',
+            'gemini-2.5-flash-lite-preview-09-2025',
+            'gemini-flash-latest',
+            'gemini-flash'
+        ]
+        for candidate in candidates:
+            if f"models/{candidate}" in available_models:
+                model_name = candidate
+                break
+                
+        if not model_name:
+            return "No supported Gemini model currently available"
+            
+        model = genai.GenerativeModel(model_name)
         response = model.generate_content(
             full_prompt,
             generation_config={
@@ -137,9 +186,7 @@ def generate_ai_response(prompt, location=None, soil_params=None, df_clean=None)
                 'top_k': 40,
                 'max_output_tokens': 800,
             }
-        )
-
-        # Some SDK responses put text in .text, others in .content; handle both
+        )        # Some SDK responses put text in .text, others in .content; handle both
         if hasattr(response, 'text') and response.text:
             return response.text
         if hasattr(response, 'content'):
@@ -1080,7 +1127,7 @@ elif page == "📍 Location Prediction":
             # Filter data for selected location
             location_data = df_clean[(df_clean['state'] == selected_state) & (df_clean['district'] == selected_district)]
             
-            # Build input features by using location means (as feature inputs to ML)
+            # Build input features by using location means
             feature_cols = [
                 'groundwater_ph',
                 'ec_groundwater_(µs/cm)',
@@ -1097,7 +1144,17 @@ elif page == "📍 Location Prediction":
                 # Fall back to global means if location has no rows
                 location_data = df_clean
             means = {col: float(location_data[col].mean()) for col in feature_cols if col in location_data.columns}
-            input_data = {**means}
+            
+            # Add required fields if missing
+            soil_defaults = {
+                'soil_ph': 7.0,
+                'soil_organic_carbon': 0.5,
+                'soil_nitrogen': 200,
+                'soil_phosphorus': 20,
+                'soil_potassium': 250,
+                'rainfall_mm': 800
+            }
+            input_data = {**soil_defaults, **means, 'state': selected_state, 'district': selected_district}
             
             # Run ML-only recommendations for selected location
             crop_recommendations, crop_predictions = get_crop_recommendations_ml_only(
@@ -1105,20 +1162,136 @@ elif page == "📍 Location Prediction":
             )
             
             if crop_predictions:
+                st.success(f"✅ Generated recommendations for {selected_state}, {selected_district}")
+                
                 # Top 3 crops by predicted yield
                 top3 = sorted(crop_predictions.items(), key=lambda kv: kv[1]['avg_yield'], reverse=True)[:3]
-                lines = [f"#{i+1} {name} — {data['avg_yield']:.1f} kg/acre" for i, (name, data) in enumerate(top3)]
-                st.success(f"Top crops for {selected_state}, {selected_district}:\n" + "\n".join(lines))
                 
-                # Save to history
+                for idx, (crop, data) in enumerate(top3):
+                    with st.expander(f"""<span style='font-size: 24px; font-weight: 800;'>#{idx+1}: {crop}</span> <span style='font-size: 16px;'>(Expected Yield: {data['avg_yield']:.1f} kg/acre)</span>""", expanded=True):
+                        col1, col2 = st.columns([2, 1])
+                        
+                        with col1:
+                            st.markdown("### 🌾 Why This Crop?")
+                            
+                            # Get soil analysis
+                            soil_condition = []
+                            ph = input_data.get('soil_ph', 7.0)
+                            if ph < 6.0:
+                                soil_condition.append("Your soil is acidic")
+                            elif ph > 7.5:
+                                soil_condition.append("Your soil is alkaline")
+                            else:
+                                soil_condition.append("Your soil pH is ideal")
+                            
+                            nitrogen = input_data.get('soil_nitrogen', 0)
+                            if nitrogen < 140:
+                                soil_condition.append("nitrogen levels are low")
+                            elif nitrogen > 350:
+                                soil_condition.append("nitrogen levels are high")
+                            else:
+                                soil_condition.append("nitrogen levels are moderate")
+                            
+                            rainfall = input_data.get('rainfall_mm', 0)
+                            if rainfall < 600:
+                                soil_condition.append("rainfall is relatively low")
+                            elif rainfall > 1200:
+                                soil_condition.append("rainfall is abundant")
+                            else:
+                                soil_condition.append("rainfall is moderate")
+                            
+                            # Format the explanation
+                            location_text = f"Based on historical data from {data['location_used']}, {crop} is an excellent choice for your farm. "
+                            yield_text = f"You can expect a yield of approximately {data['avg_yield']:.1f} kg/acre under proper cultivation conditions. "
+                            condition_text = "Current conditions show that " + ", ".join(soil_condition) + ". "
+                            
+                            recommendation_text = ""
+                            if 'Rice' in crop or 'Wheat' in crop:
+                                recommendation_text = "This crop is a staple food grain with consistent market demand. "
+                            elif 'Cotton' in crop:
+                                recommendation_text = "This is a valuable cash crop with strong commercial potential. "
+                            elif 'Sugarcane' in crop:
+                                recommendation_text = "This crop offers high yield potential and is valuable for sugar production. "
+                            elif any(x in crop.lower() for x in ['pulse', 'gram', 'lentil']):
+                                recommendation_text = "This legume crop will also help improve soil nitrogen content naturally. "
+                            
+                            st.markdown(f"""
+                            #### 📊 Crop Analysis
+                            
+                            {location_text}{yield_text}
+                            
+                            #### 🌱 Growing Conditions
+                            
+                            {condition_text}{recommendation_text}
+                            """)
+                            
+                        with col2:
+                            # Fertilizer recommendations
+                            fertilizer_recs = get_fertilizer_recommendations(input_data)
+                            if fertilizer_recs:
+                                st.markdown("### 🌿 Soil Enhancement Plan")
+                                
+                                # Group recommendations by priority
+                                critical_needs = []
+                                improvements = []
+                                maintenance = []
+                                
+                                for rec in fertilizer_recs:
+                                    if rec['status'] == 'Low':
+                                        critical_needs.append(rec)
+                                    else:
+                                        improvements.append(rec)
+                                
+                                if critical_needs:
+                                    st.markdown("#### � Priority Actions")
+                                    for rec in critical_needs:
+                                        nutrient = rec['nutrient'].replace('soil_', '').replace('_', ' ').title()
+                                        
+                                        # Create natural language recommendations
+                                        if 'fertilizers' in rec:
+                                            main_fert = rec['fertilizers'][0]  # Primary recommendation
+                                            alt_ferts = rec['fertilizers'][1:]  # Alternatives
+                                            
+                                            st.markdown(f"""
+                                            **{nutrient} Enhancement:**
+                                            
+                                            To address the low {nutrient.lower()} levels, we recommend using {main_fert}. 
+                                            
+                                            Alternative options include {', '.join(alt_ferts)}.
+                                            """)
+                                        
+                                        if 'organic_options' in rec:
+                                            org_options = rec['organic_options']
+                                            st.markdown(f"""
+                                            **Organic Alternatives:**
+                                            
+                                            For organic farming, you can use {', '.join(org_options[:-1])} or {org_options[-1]}.
+                                            """)
+                                
+                                if improvements:
+                                    st.markdown("#### 🔄 Maintenance Recommendations")
+                                    for rec in improvements:
+                                        if 'adjustments' in rec:
+                                            treatment = rec['adjustments'][0]
+                                            st.markdown(f"""
+                                            To maintain optimal soil conditions, consider applying {treatment.lower()} 
+                                            according to soil test recommendations.
+                                            """)
+                                        if 'notes' in rec:
+                                            st.info(rec['notes'])
+                
+                # Save to history with additional details
                 st.session_state.predictions_history.append({
                     'type': 'location_rf_top3',
                     'state': selected_state,
                     'district': selected_district,
+                    'timestamp': pd.Timestamp.now(),
                     'top3': [{
-                        'crop': name,
-                        'predicted_yield': data['avg_yield']
-                    } for name, data in top3]
+                        'crop': crop,
+                        'predicted_yield': data['avg_yield'],
+                        'location': data['location_used'],
+                        'model_count': data['model_count']
+                    } for crop, data in top3]
                 })
             else:
                 st.error("Unable to generate ML predictions for this location.")
@@ -1170,18 +1343,121 @@ elif page == "🔬 Parameter Prediction":
         crop_recommendations, crop_predictions = get_crop_recommendations_ml_only(input_data, models, df_clean)
         
         if crop_predictions:
-            # Top 3 crops by predicted yield
-            top3 = sorted(crop_predictions.items(), key=lambda kv: kv[1]['avg_yield'], reverse=True)[:3]
-            lines = [f"#{i+1} {name} — {data['avg_yield']:.1f} kg/acre" for i, (name, data) in enumerate(top3)]
-            st.success("Top crops:\n" + "\n".join(lines))
+            st.success("✅ Analysis complete! Here are your personalized crop recommendations:")
             
-            # Save prediction
+            # Get top 3 crops
+            top3 = sorted(crop_predictions.items(), key=lambda kv: kv[1]['avg_yield'], reverse=True)[:3]
+            
+            # Display each crop with detailed analysis
+            for idx, (crop, data) in enumerate(top3):
+                with st.expander(f"#{idx+1}: {crop}", expanded=True):
+                    col1, col2 = st.columns([2, 1])
+                    
+                    with col1:
+                        # Analyze soil conditions for this crop
+                        soil_analysis = []
+                        if soil_ph < 6.0:
+                            soil_analysis.append("your soil is acidic")
+                        elif soil_ph > 7.5:
+                            soil_analysis.append("your soil is alkaline")
+                        else:
+                            soil_analysis.append("your soil pH is in the optimal range")
+                        
+                        if nitrogen < 140:
+                            soil_analysis.append("nitrogen levels need improvement")
+                        elif nitrogen > 350:
+                            soil_analysis.append("nitrogen levels are abundant")
+                        else:
+                            soil_analysis.append("nitrogen levels are good")
+                        
+                        if phosphorus < 10:
+                            soil_analysis.append("phosphorus levels are low")
+                        elif phosphorus > 25:
+                            soil_analysis.append("phosphorus levels are high")
+                        else:
+                            soil_analysis.append("phosphorus levels are suitable")
+                        
+                        # Generate natural language explanation
+                        st.markdown("### 🌱 Crop Analysis")
+                        
+                        # Yield prediction
+                        st.markdown(f"""
+                        Based on your soil and environmental conditions, {crop.lower()} shows excellent potential 
+                        with an expected yield of {data['avg_yield']:.1f} kg/acre.
+                        
+                        #### 📊 Growing Conditions Assessment
+                        Our analysis shows that {', and '.join(soil_analysis)}. {get_crop_specific_advice(crop)}
+                        """)
+                        
+                        # Rainfall analysis
+                        rainfall_text = ""
+                        if rainfall < 600:
+                            rainfall_text = ("The rainfall in your area is relatively low. "
+                                          "Consider implementing irrigation systems for optimal growth.")
+                        elif rainfall > 900:
+                            rainfall_text = ("Your area receives abundant rainfall. "
+                                          "Ensure good drainage to prevent waterlogging.")
+                        else:
+                            rainfall_text = "The rainfall in your area is well-suited for this crop."
+                        
+                        st.markdown(f"""
+                        #### 🌧️ Water Availability
+                        {rainfall_text}
+                        """)
+                    
+                    with col2:
+                        # Fertilizer recommendations based on soil parameters
+                        # st.markdown(f"""
+                        # <div style='background-color: #f8f9fa; padding: 20px; border-radius: 10px; border-left: 5px solid #2E8B57;'>
+                        #     <h2 style='color: #000000; margin-bottom: 20px;'>🌿 Soil Enhancement Plan for <span style='font-size: 1.8em; font-weight: 800; color: #000000; display: block; margin-top: 10px; text-transform: uppercase; text-decoration: underline;'>{crop.upper()}</span></h2>
+                        # </div>
+                        # """, unsafe_allow_html=True)
+                        
+                        fertilizer_recs = get_fertilizer_recommendations(input_data)
+                        if fertilizer_recs:
+                            for rec in fertilizer_recs:
+                                if rec['status'] == 'Low':
+                                    with st.expander(f"📋 {rec['nutrient']} Management", expanded=True):
+                                        if 'fertilizers' in rec:
+                                            st.markdown(f"""
+                                            <div style='background-color: white; padding: 15px; border-radius: 5px; margin-bottom: 10px;'>
+                                                <p style='font-size: 1.1em; color: #2E8B57;'>To optimize <strong>{crop.upper()}</strong> growth, we recommend:</p>
+                                                <div style='background-color: #f0f8ff; padding: 10px; border-radius: 5px; margin: 10px 0;'>
+                                                    <strong>Primary Choice:</strong> {rec['fertilizers'][0]}
+                                                </div>
+                                                
+                                                <p style='margin-top: 15px;'><strong>Alternative Options:</strong></p>
+                                                <ul style='list-style-type: none;'>
+                                                    {' '.join([f"<li style='margin: 5px 0;'>• {fert}</li>" for fert in rec['fertilizers'][1:]])}
+                                                </ul>
+                                            </div>
+                                            """, unsafe_allow_html=True)
+                                        
+                                        if 'organic_options' in rec:
+                                            st.markdown(f"""
+                                            <div style='background-color: #f0f8ff; padding: 15px; border-radius: 5px; margin-top: 10px;'>
+                                                <p style='color: #2E8B57; font-weight: bold;'>🌱 Organic Alternatives:</p>
+                                                <ul style='list-style-type: none; margin: 10px 0;'>
+                                                    {' '.join([f"<li style='margin: 5px 0;'>• {opt}</li>" for opt in rec['organic_options']])}
+                                                </ul>
+                                            </div>
+                                            """, unsafe_allow_html=True)
+            
+            # Save prediction to history
             st.session_state.predictions_history.append({
                 'type': 'parameter_rf_top3',
                 'parameters': input_data,
+                'timestamp': pd.Timestamp.now(),
                 'top3': [{
                     'crop': name,
-                    'predicted_yield': data['avg_yield']
+                    'predicted_yield': data['avg_yield'],
+                    'soil_conditions': {
+                        'ph': soil_ph,
+                        'nitrogen': nitrogen,
+                        'phosphorus': phosphorus,
+                        'potassium': potassium,
+                        'rainfall': rainfall
+                    }
                 } for name, data in top3]
             })
         else:
