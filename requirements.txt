@@ -17,12 +17,14 @@ seaborn
 openpyxl
 scikit-learn
 shap
-# lime 
-# xgboost 
+
 tensorflow
-# catboost
-# lightgbm
+
 pytorch_tabnet
 pytorch_tabular
 python-dotenv
 requests
+# lime 
+# xgboost 
+# catboost
+# lightgbm
