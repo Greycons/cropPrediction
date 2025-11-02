@@ -17,9 +17,7 @@ seaborn
 openpyxl
 scikit-learn
 shap
-
 tensorflow
-
 pytorch_tabnet
 pytorch_tabular
 python-dotenv
