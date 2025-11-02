@@ -8,6 +8,7 @@ scikit-learn
 shap
 python-dotenv
 requests
+plotly
 # pandas
 # numpy
 # matplotlib
