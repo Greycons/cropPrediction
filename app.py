@@ -1168,7 +1168,7 @@ elif page == "📍 Location Prediction":
                 top3 = sorted(crop_predictions.items(), key=lambda kv: kv[1]['avg_yield'], reverse=True)[:3]
                 
                 for idx, (crop, data) in enumerate(top3):
-                    with st.expander(f"""<span style='font-size: 24px; font-weight: 800;'>#{idx+1}: {crop}</span> <span style='font-size: 16px;'>(Expected Yield: {data['avg_yield']:.1f} kg/acre)</span>""", expanded=True):
+                    with st.expander(f"""#{idx+1}: {crop}   (Expected Yield: {data['avg_yield']:.1f} kg/acre)""", expanded=True):
                         col1, col2 = st.columns([2, 1])
                         
                         with col1:
